@@ -16,6 +16,7 @@
 
 from __future__ import absolute_import, division, with_statement
 
+import json
 import logging
 import socket
 
@@ -126,7 +127,11 @@ class PilboxApplication(tornado.web.Application):
         tornado.web.Application.__init__(self, self.get_handlers(), **settings)
 
     def get_handlers(self):
-        return [(r"/", ImageHandler), (r"/ping", AlertHandler)]
+        return [
+            (r"/", ImageHandler),
+            (r"/info", ImageInfoHandler),
+            (r"/ping", AlertHandler),
+        ]
 
 
 class AlertHandler(tornado.web.RequestHandler):
@@ -135,46 +140,7 @@ class AlertHandler(tornado.web.RequestHandler):
         self.write("pong")
 
 
-class ImageHandler(tornado.web.RequestHandler):
-    FORWARD_HEADERS = ["Cache-Control", "Expires", "Last-Modified"]
-    OPERATIONS = ["region", "resize", "rotate", "noop"]
-
-    _FORMAT_TO_MIME = {
-        "gif": "image/gif",
-        "jpeg": "image/jpeg",
-        "jpg": "image/jpeg",
-        "png": "image/png",
-        "webp": "image/webp"}
-
-    @tornado.gen.coroutine
-    def get(self):
-        self.validate_request()
-        resp = yield self.fetch_image()
-        self.render_image(resp)
-
-    def get_argument(self, name, default=None, strip=True):
-        return super(ImageHandler, self).get_argument(name, default, strip)
-
-    def validate_request(self):
-        self._validate_operation()
-        self._validate_url()
-        self._validate_signature()
-        self._validate_client()
-        self._validate_host()
-
-        opts = self._get_save_options()
-        ops = self._get_operations()
-        if "resize" in ops:
-            Image.validate_dimensions(
-                self.get_argument("w"), self.get_argument("h"))
-            opts.update(self._get_resize_options())
-        if "rotate" in ops:
-            Image.validate_degree(self.get_argument("deg"))
-            opts.update(self._get_rotate_options())
-        if "region" in ops:
-            Image.validate_rectangle(self.get_argument("rect"))
-
-        Image.validate_options(opts)
+class BaseImageHandler(tornado.web.RequestHandler):
 
     @tornado.gen.coroutine
     def fetch_image(self):
@@ -199,12 +165,13 @@ class ImageHandler(tornado.web.RequestHandler):
                         str(e))
             raise errors.FetchError()
 
-    def render_image(self, resp):
-        outfile, outfile_format = self._process_response(resp)
-        self._set_headers(resp.headers, outfile_format)
-        for block in iter(lambda: outfile.read(65536), b""):
-            self.write(block)
-        outfile.close()
+    def get_argument(self, name, default=None, strip=True):
+        return super(BaseImageHandler, self).get_argument(name, default, strip)
+
+    def _validate_signature(self):
+        key = self.settings.get("client_key")
+        if key and not verify_signature(key, urlparse(self.request.uri).query):
+            raise errors.SignatureError("Invalid signature")
 
     def write_error(self, status_code, **kwargs):
         err = kwargs["exc_info"][1] if "exc_info" in kwargs else None
@@ -216,6 +183,75 @@ class ImageHandler(tornado.web.RequestHandler):
             self.finish(tornado.escape.json_encode(resp))
         else:
             super(ImageHandler, self).write_error(status_code, **kwargs)
+
+
+class ImageInfoHandler(BaseImageHandler):
+
+    @tornado.gen.coroutine
+    def get(self):
+        self._validate_signature()
+        resp = yield self.fetch_image()
+        image = Image(resp.buffer)
+        self.render_info(image)
+
+    def render_info(self, image):
+        info = {
+            'width': image.img.size[0],
+            'height': image.img.size[1],
+        }
+        info = json.dumps(info)
+        self._set_headers()
+        self.write(info)
+
+    def _set_headers(self):
+        self.set_header("Content-Type", "application/json")
+        self.set_header("charset", "utf-8")
+
+
+class ImageHandler(BaseImageHandler):
+    FORWARD_HEADERS = ["Cache-Control", "Expires", "Last-Modified"]
+    OPERATIONS = ["region", "resize", "rotate", "noop"]
+
+    _FORMAT_TO_MIME = {
+        "gif": "image/gif",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "png": "image/png",
+        "webp": "image/webp"}
+
+    @tornado.gen.coroutine
+    def get(self):
+        self.validate_request()
+        resp = yield self.fetch_image()
+        self.render_image(resp)
+
+    def validate_request(self):
+        self._validate_operation()
+        self._validate_url()
+        self._validate_signature()
+        self._validate_client()
+        self._validate_host()
+
+        opts = self._get_save_options()
+        ops = self._get_operations()
+        if "resize" in ops:
+            Image.validate_dimensions(
+                self.get_argument("w"), self.get_argument("h"))
+            opts.update(self._get_resize_options())
+        if "rotate" in ops:
+            Image.validate_degree(self.get_argument("deg"))
+            opts.update(self._get_rotate_options())
+        if "region" in ops:
+            Image.validate_rectangle(self.get_argument("rect"))
+
+        Image.validate_options(opts)
+
+    def render_image(self, resp):
+        outfile, outfile_format = self._process_response(resp)
+        self._set_headers(resp.headers, outfile_format)
+        for block in iter(lambda: outfile.read(65536), b""):
+            self.write(block)
+        outfile.close()
 
     def _process_response(self, resp):
         ops = self._get_operations()
@@ -310,11 +346,6 @@ class ImageHandler(tornado.web.RequestHandler):
         client = self.settings.get("client_name")
         if client and self.get_argument("client") != client:
             raise errors.ClientError("Invalid client")
-
-    def _validate_signature(self):
-        key = self.settings.get("client_key")
-        if key and not verify_signature(key, urlparse(self.request.uri).query):
-            raise errors.SignatureError("Invalid signature")
 
     def _validate_host(self):
         hosts = self.settings.get("allowed_hosts", [])
